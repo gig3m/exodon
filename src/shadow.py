@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import html
 import re
 import pathlib
 import sqlite3
@@ -123,10 +124,78 @@ def phish_rule(msg: dict) -> str | None:
     return None
 
 
+# Drip-sequence cold sales: "Re:" on a thread the owner never joined, quoting
+# only the sender's own earlier messages. The quoted history reads as a real
+# back-and-forth and the model lets it through (one real drip
+# follow-up scored 0.0002; the same text cut before the quote, 0.9997).
+# decide() spares anyone the owner has written to, like the webmail rule.
+WROTE = re.compile(r"\bwrote\s*:", re.I)
+ATTRIBUTION_ON = re.compile(r"\bOn\s")  # capital "On", as mail clients write it
+EMAIL = re.compile(r"[\w.+'-]+@[\w-]+(?:\.[\w-]+)+")
+# History quoted without a "wrote:" line (Outlook's header block, a forward).
+# Its author can't be checked, so each one counts as somebody else.
+HEADER_QUOTE = re.compile(
+    r"-{2,}\s*(?:original\s+message|forwarded\s+message)\s*-{2,}|begin\s+forwarded\s+message|_{10,}"
+    r"|\bFrom:\s.{0,300}?\b(?:Sent|Date|Subject|To):"
+    r"|\b(?:Von|De|Da|Van|Från|Fra):\s.{0,200}?\b(?:Gesendet|Envoyé|Inviato|Verzonden|Skickat|Sendt|Enviado):"
+    # Attribution lines in other languages ("Am ... schrieb X:", "Le ... a écrit :").
+    r"|\b(?:schrieb|a\s+écrit|escribió|ha\s+scritto|skrev|schreef|napisał|escreveu)\b", re.I)
+# The author's address(es) as an attribution ends: "<a@b> [a@b] wrote:".
+AUTHOR_TAIL = re.compile(r"((?:[<\[(][^<>\[\]()]*[>\])]\s*)*)wrote:$")
+# An attribution starts "On <date>": a digit before any sentence ends.
+DATED_ON = re.compile(r"On\s[^.!?]{0,60}?\d")
+
+
+def attributions(body: str) -> list[str]:
+    """Each "On <date>, <who> wrote:" line of a body's quoted history, with
+    quote markers and line wrapping undone. A "wrote:" with no "On" before it
+    comes back empty, which the rule reads as someone it can't name, and so
+    does each header-style quote (HEADER_QUOTE)."""
+    body = html.unescape(body or "")  # HTML-only parts keep "&lt;a@b&gt;" after strip_html
+    text = " ".join(re.sub(r"(?m)^[ \t>]+", " ", body).split())
+    text = re.sub(r"\]\s*>(?=\s*wrote\b)", "] ", text, flags=re.I)  # "[a@b]> wrote:"
+    out, prev = [], 0
+    for w in WROTE.finditer(text):
+        # Look back no further than the previous attribution, so one never
+        # borrows another's "On" or the sender's own signature.
+        window = text[max(prev, w.start() - 300):w.start()]
+        prev = w.end()
+        starts = [m.start() for m in ATTRIBUTION_ON.finditer(window)]
+        seg = window[starts[-1]:].strip() if starts else ""
+        out.append(seg + " wrote:" if DATED_ON.match(seg) else "")
+    return out + [""] * len(HEADER_QUOTE.findall(text))
+
+
+def self_quote_rule(msg: dict) -> str | None:
+    """The rule's name if this reply quotes nobody but its own sender: every
+    attribution carries the sender's address or their full display name (the
+    name follows a campaign that moves to a new domain)."""
+    quoted = msg.get("attributions") or []
+    subject = (msg.get("subject") or "").translate(CONFUSABLES)
+    if not quoted or not REPLY.match(subject):
+        return None
+    addr = (msg.get("from_email") or "").lower()
+    name = " ".join((msg.get("from_name") or "").lower().split())
+    # The name must be the whole author: after the date (a comma, a digit or
+    # am/pm), straight before the address brackets and "wrote:".
+    named = (re.compile(r"(?:,|\d|\b[ap]\.?m\.?)\s*\"?" + re.escape(name) + r"\"?\s*"
+                        + AUTHOR_TAIL.pattern) if len(name.split()) >= 2 else None)
+    for a in quoted:
+        low = " ".join(a.lower().split())
+        tail = AUTHOR_TAIL.search(low)
+        if not tail:
+            return None
+        bare = re.search(r"(\S+?)[\s>]*$", low[:tail.start()])  # "a@b > wrote:"
+        own = {e for e in EMAIL.findall(tail.group(1) + " " + (bare.group(1) if bare else ""))}
+        if addr not in own and not (named and named.search(low)):
+            return None
+    return "self-quoted follow-up"
+
+
 def decide(msg: dict, entries: list, model, screen_at: float | None = None,
            review_at: float | None = None, wrote_to=None) -> dict:
     """Lists first (allow only when authenticated), then the webmail-receipt
-    rule, the model for the rest. The model still scores rule hits, for the record.
+    and self-quoted follow-up rules, the model for the rest. The model still scores rule hits, for the record.
     `wrote_to(address)` -> has the owner ever sent mail there; the rule spares
     those senders. Without it the rule spares nobody."""
     screen_at = config.SCREEN_AT if screen_at is None else screen_at
@@ -142,9 +211,12 @@ def decide(msg: dict, entries: list, model, screen_at: float | None = None,
             return {**d, "source": "allow", "would": "inbox", "list_entry": e.raw}
         d["list_note"] = f"allow {e.raw} ignored: not authenticated ({why})"
         d["list_entry"] = e.raw
-    rule = phish_rule(msg)
+    rule = phish_rule(msg) or self_quote_rule(msg)
     if rule and wrote_to and wrote_to(msg["from_email"]):
         rule = None
+    if rule == "self-quoted follow-up" and d["list_note"] is None:
+        # The attribution usually sits past the logged preview; say what fired.
+        d["list_note"] = f"quotes only: {msg['attributions'][0][:160]}"
     v = model.score(msg)
     if rule:
         p = None if v.error is not None else v.p_spam
@@ -339,6 +411,8 @@ def extract(m: dict) -> dict:
         "subject": m.get("subject") or "",
         "received_at": m.get("receivedAt") or "",
         "preview": B.clean(body or m.get("preview") or "")[:600],
+        # From the whole body: the quoted history usually starts past the preview.
+        "attributions": attributions(body),
         "auth_results": m.get("header:Authentication-Results:asText:all") or [],
         "fastmail_score": score,
         "mailbox_ids": m.get("mailboxIds") or {},
@@ -423,7 +497,7 @@ class Shadow:
 
     def wrote_to(self, address: str) -> bool:
         """Is there mail to this address in Sent? A failed lookup answers yes,
-        so the webmail rule stands down and the model decides instead."""
+        so the rules stand down and the model decides instead."""
         if not self.sent:
             return True
         who = {"operator": "OR", "conditions": [{"to": address}, {"cc": address},
@@ -618,10 +692,10 @@ def digest(store: Store, account: str, since: str,
            local: dt.datetime | None = None) -> tuple[str, str]:
     """The daily digest for one live mailbox: (subject, text), text empty
     when nothing was unsure. Unsure = left in the Inbox on a review score, or
-    moved to Spam on a model score below SURE_AT or by the webmail-receipt rule
-    (block-list moves are sure)."""
+    moved to Spam on a model score below SURE_AT or by a rule (block-list moves
+    are sure)."""
     q = lambda sql: store.db.execute(sql, (account, since)).fetchall()
-    cols = "from_name, from_email, subject, p_spam, source"
+    cols = "from_name, from_email, subject, p_spam, source, list_entry"
     unsure = f"(source='rule' or (source='model' and p_spam<{config.SURE_AT}))"
     kept = q(f"select {cols} from decisions where account=? and decided_at>? "
              "and would='review' order by p_spam desc")
@@ -634,9 +708,9 @@ def digest(store: Store, account: str, since: str,
 
     def lines(rows):
         out = []
-        for name, addr, subj, p, source in rows:
+        for name, addr, subj, p, source, entry in rows:
             who = f"{name} <{addr}>" if name else addr
-            tag = "webmail receipt rule" if source == "rule" else f"{p:.2f}"
+            tag = f"rule: {entry}" if source == "rule" else f"{p:.2f}"
             out.append(f"  {who}\n      {subj or '(no subject)'}   [{tag}]")
         return out
 

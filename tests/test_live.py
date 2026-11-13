@@ -193,6 +193,21 @@ class LiveWatcher(unittest.TestCase):
         self.watcher(c, 0.0).process(["E1"])
         self.assertEqual(c.moves, [])
 
+    def test_self_quoted_followup_past_the_preview_cut_moves_to_spam(self):
+        m = mail("E1", frm="dana.r@lender.example")
+        m["from"][0]["name"] = "Dana Reyes"
+        m["subject"] = "Re: quick question for Sam"
+        # The attribution sits beyond the 600 characters the model and the log see.
+        body = ("Happy to pass along case studies. " * 25 + "\n\nOn Wed, November 11, 2026 "
+                "4:13 PM, Dana Reyes <dana.r@lender.example> wrote:\n> Could I send terms?\n")
+        m["textBody"] = [{"partId": "1", "type": "text/plain"}]
+        m["bodyValues"] = {"1": {"value": body}}
+        c = FakeLive({"E1": m})
+        self.watcher(c, 0.0).process(["E1"])
+        self.assertEqual(c.moves, [("E1", "I", "J")])
+        self.assertEqual(self.st.db.execute("select list_entry from decisions").fetchone()[0],
+                         "self-quoted follow-up")
+
     def test_failed_sent_lookup_leaves_it_to_the_model(self):
         c = FakeLive({"E1": self.receipt("x@gmail.com")}, sent_fails=True)
         self.watcher(c, 0.0).process(["E1"])
@@ -296,9 +311,11 @@ class Digest(unittest.TestCase):
         self.st.db.close()
         self.tmp.cleanup()
 
-    def add(self, i, would, source="model", p=0.5, action=None, at="2026-10-04T12:00:00+00:00"):
+    def add(self, i, would, source="model", p=0.5, action=None, at="2026-10-04T12:00:00+00:00",
+            entry=None):
         self.st.record({"account": "personal", "email_id": i, "decided_at": at, "would": would,
-                        "source": source, "p_spam": p, "from_email": f"{i}@x.example",
+                        "source": source, "p_spam": p, "list_entry": entry,
+                        "from_email": f"{i}@x.example",
                         "from_name": f"Name {i}", "subject": f"Subject {i}", "action": action})
 
     def test_lists_the_unsure_and_counts_the_sure(self):
@@ -317,11 +334,12 @@ class Digest(unittest.TestCase):
             self.assertNotIn(absent, text)
 
     def test_rule_moves_are_listed_as_unsure(self):
-        self.add("phish", "screen", source="rule", p=None, action="moved")
+        self.add("phish", "screen", source="rule", p=None, action="moved",
+                 entry="webmail receipt/notice")
         self.add("sure", "screen", p=1.0, action="moved")
         subj, text = S.digest(self.st, "personal", "2026-10-03T00:00:00+00:00")
         self.assertIn("1 unsure email", subj)
-        self.assertIn("Subject phish   [webmail receipt rule]", text)
+        self.assertIn("Subject phish   [rule: webmail receipt/notice]", text)
         self.assertIn("Also moved 1 to Spam", text)
 
     def test_nothing_unsure_means_no_digest(self):

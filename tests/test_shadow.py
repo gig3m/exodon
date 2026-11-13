@@ -130,6 +130,151 @@ class Decide(unittest.TestCase):
                      FakeModel(error="timeout"))
         self.assertEqual((d["source"], d["would"], d["p_spam"]), ("rule", "screen", None))
 
+    # A drip-sequence follow-up (synthetic), shaped like JMAP's text part.
+    DRIP = ("Hello Sam, I've got a few case studies from businesses we recently funded.\n"
+            "Can we chat Monday or Tuesday?\n- Dana\n\n"
+            "On Wed, November 11, 2026 4:13 PM, Dana Reyes <dana.r@lender.example>\n"
+            "[dana.r@lender.example]> wrote:\n"
+            "> Could I go ahead and send over the pricing and terms?\n>\n"
+            "> On Mon, November 9, 2026 4:58 PM, Dana Reyes <dana.r@lender.example>\n"
+            "> [dana.r@lender.example]> wrote:\n> > Sam, you simply don't need capital at all?\n")
+
+    def drip(self, body=None, subject="Re: quick question for Sam", addr="dana.r@lender.example",
+             name="Dana Reyes"):
+        return {**msg(addr, name=name), "subject": subject,
+                "attributions": S.attributions(self.DRIP if body is None else body)}
+
+    def test_attributions_survive_wrapping_and_quote_markers(self):
+        got = S.attributions(self.DRIP)
+        self.assertEqual(len(got), 2)
+        for a in got:
+            self.assertTrue(a.startswith("On "), a)
+            self.assertIn("dana.r@lender.example", a)
+        self.assertEqual(S.attributions("Thanks, see you Sunday."), [])
+
+    def test_self_quoted_followup_is_screened_whatever_the_model_says(self):
+        d = S.decide(self.drip(), [], FakeModel(p=0.0002), wrote_to=lambda a: False)
+        self.assertEqual((d["source"], d["would"], d["list_entry"]),
+                         ("rule", "screen", "self-quoted follow-up"))
+        self.assertEqual(d["p_spam"], 0.0002)
+
+    def test_self_quoted_rule_follows_the_name_across_a_new_domain(self):
+        body = self.DRIP.replace("dana.r@lender.example", "dana@oldlender.example")
+        d = S.decide(self.drip(body), [], FakeModel(p=0.1), wrote_to=lambda a: False)
+        self.assertEqual(d["source"], "rule")
+
+    def test_self_quoted_rule_spares_real_threads(self):
+        owner = ("Sounds good.\n\nOn Tue, Nov 10, 2026 at 9:02 AM Kyle Arrington "
+                 "<kyle@example.com> wrote:\n> Can you send the quote?\n")
+        mixed = self.DRIP + ("> > On Fri, Nov 6, 2026, Kyle Arrington <kyle@example.com> wrote:\n"
+                             "> > > Tell me more\n")
+        nameless = "Following up.\n\nOn Mon, Nov 9, 2026, someone wrote:\n> hi\n"
+        cases = [("someone the owner replied to", self.drip(owner)),
+                 ("owner somewhere in the chain", self.drip(mixed)),
+                 ("attribution that names nobody we know", self.drip(nameless)),
+                 ("no quoted history", self.drip("Just checking in on this.")),
+                 ("not a reply", self.drip(subject="quick question for Sam")),
+                 ("one-word display name only", self.drip(
+                     self.DRIP.replace("dana.r@lender.example", "j@other.example"), name="Dana"))]
+        for why, m in cases:
+            d = S.decide(m, [], FakeModel(p=0.1), wrote_to=lambda a: False)
+            self.assertEqual(d["source"], "model", why)
+
+    def test_self_quoted_rule_abstains_on_header_style_history(self):
+        # Adversarial review, 2026-11-13: Outlook quotes the owner with a header
+        # block, not "wrote:", so the rule must not read that chain as sender-only.
+        outlook = ("For your review.\nOn Thu, Nov 12, 2026, Alice Jones <alice@vendor.example> "
+                   "wrote:\n> Here is the revised proposal.\n> -----Original Message-----\n"
+                   "> From: Kyle Arrington <kyle@example.com>\n> Sent: Wednesday, November 11, "
+                   "2026 10:00 AM\n> To: Alice Jones <alice@old-vendor.example>\n"
+                   "> Subject: Proposal\n> Please send me the revision.\n")
+        bare_header = outlook.replace("> -----Original Message-----\n", "")
+        forwarded = ("FYI\nOn Thu, Nov 12, 2026, Alice Jones <alice@vendor.example> wrote:\n"
+                     "> ---------- Forwarded message ---------\n> From: Bob <bob@x.example>\n"
+                     "> Date: Wed, Nov 11, 2026\n> hi\n")
+        for why, body in (("original message", outlook), ("bare From/Sent header", bare_header),
+                          ("forwarded message", forwarded)):
+            m = self.drip(body, subject="Fwd: Proposal", addr="alice@vendor.example",
+                          name="Alice Jones")
+            d = S.decide(m, [], FakeModel(p=0.1), wrote_to=lambda a: False)
+            self.assertEqual(d["source"], "model", why)
+
+    def test_self_quoted_rule_needs_the_whole_name_not_a_prefix(self):
+        body = ("See below.\nOn Thu, Nov 12, 2026, Ann Smithson <ann.smithson@customer.example> "
+                "wrote:\n> Please send the updated proposal.\n")
+        m = self.drip(body, subject="Fwd: Proposal", addr="ann@vendor.example", name="Ann Smith")
+        d = S.decide(m, [], FakeModel(p=0.1), wrote_to=lambda a: False)
+        self.assertEqual(d["source"], "model")
+
+    def test_attribution_must_be_a_dated_on_line(self):
+        # Fresh-context review, 2026-11-13: the look-back window borrowed the
+        # sender's own prose and signature for someone else's attribution.
+        borrowed = ("On second thought, Tuesday works.\nDana Reyes\n\n"
+                    "Kyle Arrington <kyle@example.com> wrote:\n> Tuesday?\n")
+        prose = "On Friday I spoke to Bob. Dana Reyes here again. As the CFO wrote: no.\n"
+        after_own = (self.DRIP + "\nKyle Arrington <kyle@example.com> wrote:\n> > > hi\n")
+        for why, body in (("borrowed signature", borrowed), ("prose wrote", prose),
+                          ("undated attribution after the sender's", after_own)):
+            d = S.decide(self.drip(body), [], FakeModel(p=0.1), wrote_to=lambda a: False)
+            self.assertEqual(d["source"], "model", why)
+
+    def test_self_quoted_rule_abstains_on_foreign_attributions(self):
+        body = self.DRIP + "> > Am 5. Nov. 2026 schrieb Kyle Arrington <kyle@example.com>:\n> > > ja\n"
+        d = S.decide(self.drip(body), [], FakeModel(p=0.1), wrote_to=lambda a: False)
+        self.assertEqual(d["source"], "model")
+
+    def test_self_quoted_rule_notes_what_it_matched(self):
+        d = S.decide(self.drip(), [], FakeModel(p=0.1), wrote_to=lambda a: False)
+        self.assertTrue(d["list_note"].startswith("quotes only: On Wed, November 11"), d["list_note"])
+
+    def test_self_quoted_rule_abstains_on_more_header_styles(self):
+        # Round 2 reviews: classic Outlook [mailto:], Apple forwards, other orders, localized.
+        top = "On Thu, Nov 12, 2026, Alice Jones <alice@vendor.example> wrote:\n> Proposal\n"
+        headers = {
+            "outlook mailto": "> From: Kyle Arrington [mailto:kyle@example.com]\n> Sent: Wed\n",
+            "apple forward": "> Begin forwarded message:\n> From: Bob <b@x.example>\n"
+                             "> Subject: Hi\n> Date: Nov 11\n",
+            "to/subject first": "> From: Bob <b@x.example>\n> To: Alice\n> Subject: P\n"
+                                "> Sent: Wed\n",
+            "german outlook": "> Von: Kyle Arrington <kyle@example.com>\n> Gesendet: Mittwoch\n",
+        }
+        for why, h in headers.items():
+            m = self.drip(top + h, subject="Fwd: Proposal", addr="alice@vendor.example",
+                          name="Alice Jones")
+            d = S.decide(m, [], FakeModel(p=0.1), wrote_to=lambda a: False)
+            self.assertEqual(d["source"], "model", why)
+
+    def test_self_quoted_rule_wants_the_author_right_before_wrote(self):
+        longer = ("See below.\nOn Thu, Nov 12, 2026, Ann Smith Jones <other@customer.example> "
+                  "wrote:\n> Please send the proposal.\n")
+        m = self.drip(longer, subject="Fwd: Proposal", addr="ann@vendor.example", name="Ann Smith")
+        self.assertEqual(S.decide(m, [], FakeModel(p=0.1), wrote_to=lambda a: False)["source"],
+                         "model", "longer name")
+        prose = ("On Monday 11/9 I sent the deck\nDana Reyes\n\n"
+                 "Kyle Arrington <kyle@example.com> wrote:\n> deck?\n")
+        self.assertEqual(S.decide(self.drip(prose), [], FakeModel(p=0.1),
+                                  wrote_to=lambda a: False)["source"], "model", "prose On+digit")
+        gmail = ("Bump.\nOn Wed, Nov 11, 2026 at 4:13 PM Dana Reyes "
+                 "<dana@oldlender.example> wrote:\n> hi\n")
+        self.assertEqual(S.decide(self.drip(gmail), [], FakeModel(p=0.1),
+                                  wrote_to=lambda a: False)["source"], "rule", "gmail time then name")
+        stray = ("Bump.\nOn Wed, Nov 4, 2026 3:05:02 PM Dana R dana.r@lender.example >\n"
+                 "wrote:\n> hi\n")
+        self.assertEqual(S.decide(self.drip(stray), [], FakeModel(p=0.1),
+                                  wrote_to=lambda a: False)["source"], "rule", "bare address, stray >")
+        escaped = self.DRIP.replace("<", "&lt;").replace(">", "&gt;")  # HTML-only part
+        self.assertEqual(S.decide(self.drip(escaped), [], FakeModel(p=0.1),
+                                  wrote_to=lambda a: False)["source"], "rule", "html entities")
+
+    def test_self_quoted_rule_spares_people_the_owner_has_written_to(self):
+        d = S.decide(self.drip(), [], FakeModel(p=0.1),
+                     wrote_to=lambda a: a == "dana.r@lender.example")
+        self.assertEqual((d["source"], d["would"]), ("model", "inbox"))
+
+    def test_authenticated_allow_beats_the_self_quoted_rule(self):
+        d = S.decide(self.drip(), entries("@lender.example"), FakeModel(), wrote_to=lambda a: False)
+        self.assertEqual(d["source"], "allow")
+
     def test_model_error_is_logged_not_guessed(self):
         d = S.decide(msg("x@new.example"), [], FakeModel(error="timeout"))
         self.assertEqual(d["would"], "error")

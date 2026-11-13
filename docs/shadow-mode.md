@@ -85,13 +85,35 @@ instead when it exists, so a secrets-manager wrapper can live there. Mail
 tokens go only to the watcher (override file), never in `.env`, which the
 review page also loads.
 
+## Code rules
+
+Two patterns the model reliably gets wrong are screened in code
+(`shadow.decide`), after the lists and before the model's verdict counts. The
+model still scores them, for the record. Both stand down for any sender the
+owner has written to (a Sent-folder query; a failed lookup also stands down).
+
+- **webmail receipt/notice**: a free-webmail sender, a subject that isn't a reply,
+  and a transactional subject (receipt, invoice, order #...).
+- **self-quoted follow-up** (2026-11-13): a `Re:`/`Fwd:` subject whose quoted
+  history (`On <date>, <who> wrote:` lines, read from the whole body, not
+  the 600-char preview) names only the sender, by address or full display
+  name, each on a dated `On ...` line. Header-style quotes (Outlook's `From:/Sent:`,
+  forwards) and non-English attributions make it abstain, since their author
+  can't be checked. Drip-sequence cold sales quote their own earlier pitches,
+  and the model reads that as a real conversation. Backtest over every logged
+  reply (both mailboxes, 2026-11-13): 88 would screen, all filed as spam or
+  deleted by the owner, 14 of them mail the model had left in the Inbox or
+  review band. One real message matched (a travel agent quoting her own
+  email) and was spared because the owner had written to her. The known gap:
+  a genuine stranger bumping their own unanswered email is screened.
+
 ## Live mode
 
 Per mailbox, `EXODON_<NAME>_MODE=live` (run a mailbox in shadow first, then switch it
 to live once the report looks right). Same watcher, same decision, same log and grading, plus:
 
-- **The move.** A `screen` decision (block list, or model >= `EXODON_SCREEN_AT`,
-  0.95 since 2026-10-04) on a message that is in the Inbox and nowhere else is
+- **The move.** A `screen` decision (block list, a code rule, or model >=
+  `EXODON_SCREEN_AT`, 0.95 since 2026-10-04) on a message that is in the Inbox and nowhere else is
   moved to the provider's Spam folder (role `junk`). Mail a rule already
   filed elsewhere is left alone. The row records `action` = `moved` (or
   `move failed: ...`, message untouched) and `acted_at`.
