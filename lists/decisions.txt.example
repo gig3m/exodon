@@ -1,0 +1,13 @@
+# Your rulings on senders the mailbox cannot settle on its own -- ones that
+# appear in both your spam folder and your archive/sent mail. Copy to
+# decisions.txt (gitignored).
+#
+# `python3 src/lists.py seed` applies these first and never asks about a
+# pattern listed here again; everything unresolved lands in
+# spike/proposed/decide.txt for review.
+#
+#     allow <pattern>   # note
+#     block <pattern>   # note
+
+allow @bigvendor.example        # one promo was filed as spam; the company is fine
+block @bulk-platform.example    # whole sending platform is spam for me

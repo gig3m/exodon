@@ -1,0 +1,20 @@
+# Allow list: senders that are never screened, whatever the model says.
+# Copy to allow.txt (gitignored). Generate a starting point from your own
+# mailbox with `python3 src/lists.py seed` (writes to spike/proposed/).
+#
+# One pattern per line, case-insensitive; `#` starts a note.
+#   bob@acme.com          exact address
+#   @acme.com             acme.com and every subdomain (mail.acme.com)
+#   *@acme.com            glob on the full address -- only acme.com itself
+#   billing-*@acme.com    glob; * and ? anywhere in the address
+#   name:*Acme Billing*   glob on the display name
+#   re:@acme\.(com|net)$  regular expression searched in the address
+#
+# The most specific matching entry wins across allow and block
+# (exact > glob > domain, deeper domain first > name: > re:); an exact tie
+# goes to allow. Allow entries only count for authenticated mail, so a
+# forged From: cannot use them.
+
+@example.com                  # your own company
+@bigcustomer.com              # you emailed them; 1200 archived
+jane.doe@gmail.com            # free-mail: always per person, never @gmail.com

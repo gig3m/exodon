@@ -1,0 +1,9 @@
+# Block list: senders screened without asking the model.
+# Copy to block.txt (gitignored). Same syntax as allow.txt.example.
+# Most spam rotates domains, so this list stays small; the model does the
+# catching. Use it for repeat offenders and patterns that survive rotation.
+
+@leadgen-vendor.example       # 8 in the spam folder, never archived or emailed
+newsletter@mail.platform.example   # one sender on a shared platform, not the platform
+name:*Quick Funding*          # same display name across rotating domains
+re:familyoffice.*\.(info|shop)$    # a family of throwaway domains

@@ -1,0 +1,58 @@
+# exodon watcher + review page. Start with ./up.sh; for a code change
+# `docker restart exodon exodon-web` is enough.
+#
+# Mail tokens: put the variables your .env names (EXODON_<NAME>_JMAP_TOKEN_ENV,
+# EXODON_<NAME>_JMAP_WRITE_TOKEN_ENV) in a docker-compose.override.yml next to
+# this file (gitignored), e.g.
+#   services:
+#     exodon:
+#       environment:
+#         MY_WORK_RO_JMAP: ${MY_WORK_RO_JMAP:?set it}
+services:
+  exodon:
+    build: .
+    image: exodon:latest
+    container_name: exodon
+    restart: unless-stopped
+    init: true
+    # Settings come from ../.env (mounted below). Keep mail tokens OUT of .env:
+    # the review page mounts and loads it too. Pass them only to this service,
+    # in the override file above.
+    # Use exodon-only tokens (Mail read/write, no submission): Fastmail
+    # allows one push stream per token, so nothing else may share them.
+    volumes:
+      - ..:/app:ro          # code, .env and lists/ -- the service never writes them
+      - ../var:/app/var     # decision log and daily report
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+  # The review page. No mail token; reachable only through the reverse proxy
+  # (nginx-proxy-manager here; no host port), and the only container that may
+  # write lists/.
+  exodon-web:
+    image: exodon:latest
+    container_name: exodon-web
+    command: ["python3", "src/web.py"]
+    environment:
+      # only the proxy may connect; other containers share its network
+      EXODON_WEB_PROXY: nginx-proxy-manager
+      # GET /api/readout for other containers on this network: set
+      # EXODON_WEB_READERS and EXODON_READOUT_TOKEN_<READER> in .env or the
+      # override file (README, Readout)
+    restart: unless-stopped
+    init: true
+    depends_on: [exodon]
+    networks: [npm]
+    volumes:
+      - ..:/app:ro
+      - ../var:/app/var
+      - ../lists:/app/lists
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+networks:
+  npm:
+    name: nginx-proxy-manager_default
+    external: true

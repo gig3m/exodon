@@ -1,0 +1,21 @@
+# Built from real mail: samples, scored results, generated list proposals,
+# and the spike write-up (names real senders). Never commit.
+spike/
+
+# Live lists and rulings name real people and companies.
+# The *.example stubs next to them are tracked.
+lists/*
+!lists/*.example
+
+# Personal settings and secrets
+.env
+
+# Shadow mode's decision log (real senders and subjects)
+var/
+
+__pycache__/
+.venv/
+
+# Per-host deployment settings
+docker/docker-compose.override.yml
+docker/up.local.sh
